@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+*.egg-info/
+build/
+dist/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.claude/
+.agents/
