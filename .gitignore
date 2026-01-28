@@ -6,8 +6,3 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-CLAUDE.md
-AGENTS.md
-GEMINI.md
-.claude/
-.agents/
