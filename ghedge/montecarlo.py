@@ -1,7 +1,7 @@
 """Monte Carlo pricing of the GMMB with antithetic and control variates."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -99,7 +99,7 @@ def price_gmmb(contract: GMMBContract, model, n_paths=100_000, method="plain", r
     if method not in METHODS:
         raise ValueError(f"method must be one of {METHODS}")
     if model.mu is not None:
-        model = type(model)(**{**model.__dict__, "mu": None})
+        model = replace(model, mu=None)
     antithetic = method.startswith("antithetic")
     s_t, w_t = simulate_terminal(contract, model, n_paths, rng, antithetic, steps_per_year)
     disc = np.exp(-contract.rate * contract.maturity)
