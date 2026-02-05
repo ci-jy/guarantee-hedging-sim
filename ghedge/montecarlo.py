@@ -10,6 +10,7 @@ from scipy.stats import norm
 from . import blackscholes as bs
 from .contract import GMMBContract
 from .models import GBM, Heston, pair_means
+from .rates.hybrid import HybridModel
 
 METHODS = ("plain", "antithetic", "control", "antithetic_control")
 
@@ -78,6 +79,13 @@ def shadow_gbm_sigma(contract: GMMBContract, model) -> float:
     return model.sigma
 
 
+def risk_neutral(model):
+    """The pricing-measure version of a model with a real-world drift."""
+    if isinstance(model, HybridModel):
+        return model.risk_neutral()
+    return replace(model, mu=None) if model.mu is not None else model
+
+
 def price_gmmb(contract: GMMBContract, model, n_paths=100_000, method="plain", rng=None,
                steps_per_year=50) -> MCResult:
     """Risk-neutral Monte Carlo value of the cohort maturity guarantee.
@@ -95,17 +103,27 @@ def price_gmmb(contract: GMMBContract, model, n_paths=100_000, method="plain", r
         known in closed form.
     antithetic_control
         Both techniques: control variates applied to antithetic pair averages.
+
+    For a :class:`~ghedge.rates.hybrid.HybridModel` each path is discounted
+    with its own stochastic discount factor ``D(0, T)`` instead of the flat
+    rate, and ``D(0, T)`` (mean ``P(0, T)``) is an extra control.
     """
     if method not in METHODS:
         raise ValueError(f"method must be one of {METHODS}")
-    if model.mu is not None:
-        model = replace(model, mu=None)
+    model = risk_neutral(model)
     antithetic = method.startswith("antithetic")
-    s_t, w_t = simulate_terminal(contract, model, n_paths, rng, antithetic, steps_per_year)
-    disc = np.exp(-contract.rate * contract.maturity)
+    if isinstance(model, HybridModel):
+        s_t, disc, w_t = model.simulate_terminal(contract.premium, contract.maturity, n_paths,
+                                                 rng, antithetic)
+    else:
+        s_t, w_t = simulate_terminal(contract, model, n_paths, rng, antithetic, steps_per_year)
+        disc = np.exp(-contract.rate * contract.maturity)
     y = disc * contract.payoff(s_t)
 
     controls, means = [disc * s_t], [contract.premium]
+    if isinstance(model, HybridModel):
+        controls.append(disc)
+        means.append(float(model.hw.curve.discount(contract.maturity)))
     if isinstance(model, Heston):
         sig = shadow_gbm_sigma(contract, model)
         shadow = contract.premium * np.exp((contract.rate - 0.5 * sig**2) * contract.maturity + sig * w_t)

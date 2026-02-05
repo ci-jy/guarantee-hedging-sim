@@ -28,16 +28,17 @@ TRADING_DAYS = 252
 
 
 class BSHedger:
-    """Values and hedges with Black-Scholes at a fixed volatility."""
+    """Values and hedges with Black-Scholes at a fixed volatility and the
+    contract's flat rate (a simulated short rate, if given, is ignored)."""
 
     def __init__(self, contract: GMMBContract, sigma: float, label: str | None = None):
         self.contract, self.sigma = contract, sigma
         self.label = label or f"BS delta (sigma={sigma:.1%})"
 
-    def value(self, t, index, variance=None):
+    def value(self, t, index, variance=None, rate=None):
         return bs.gmmb_value(self.contract, self.sigma, index, t)
 
-    def delta(self, t, index, variance=None):
+    def delta(self, t, index, variance=None, rate=None):
         return bs.gmmb_delta(self.contract, self.sigma, index, t)
 
 
@@ -99,13 +100,20 @@ def cvar(pnl, alpha: float = 0.95) -> float:
 
 
 def backtest(paths: Paths, contract: GMMBContract, hedger, rebalance_every: int = 1,
-             cost_rate: float = 0.0, price=None) -> HedgeResult:
+             cost_rate: float = 0.0, price=None, bond_cost_rate: float | None = None) -> HedgeResult:
     """Run the discrete hedge on every simulated (or historical) path.
 
     ``paths.times`` must start at 0 and end at the contract maturity.
     ``price`` (the amount charged for the guarantee; scalar or one value per
     path) defaults to the hedger's own
     model value at time 0.
+
+    If the paths carry a stochastic discount factor (``paths.discount``), cash
+    accrues at the simulated short rate, P&L is discounted pathwise and the
+    hedger is called with the current short rate (``rate=`` keyword). A hedger
+    with a ``bond_units`` method also trades the zero-coupon bond whose prices
+    are in ``paths.bond``, paying ``bond_cost_rate`` (default: ``cost_rate``)
+    per unit of value traded.
     """
     times = paths.times
     s = paths.index
@@ -115,33 +123,63 @@ def backtest(paths: Paths, contract: GMMBContract, hedger, rebalance_every: int 
         raise ValueError("path grid must end at the contract maturity")
     r = contract.rate
     var_at = (lambda j: None) if v is None else (lambda j: v[:, j])
+    stochastic = paths.discount is not None
+    if stochastic:
+        disc = paths.discount
+        state = lambda j: {"rate": paths.short_rate[:, j]}
+        growth = lambda j0, j1: disc[:, j0] / disc[:, j1]
+        pv = lambda j: disc[:, j]
+    else:
+        state = lambda j: {}
+        growth = lambda j0, j1: np.exp(r * (times[j1] - times[j0]))
+        pv = lambda j: np.exp(-r * times[j])
+    use_bond = hasattr(hedger, "bond_units")
+    if use_bond and paths.bond is None:
+        raise ValueError("hedger trades a bond but the paths carry no bond prices")
+    bond_cost_rate = cost_rate if bond_cost_rate is None else bond_cost_rate
 
     if price is None:
-        price = hedger.value(0.0, s[:, 0], var_at(0))
+        price = hedger.value(0.0, s[:, 0], var_at(0), **state(0))
     price = np.broadcast_to(np.asarray(price, dtype=float), s[:, 0].shape)
     dates = list(range(0, n_steps, rebalance_every))
 
-    delta = np.broadcast_to(hedger.delta(times[0], s[:, 0], var_at(0)), s[:, 0].shape).astype(float)
+    delta = np.broadcast_to(hedger.delta(times[0], s[:, 0], var_at(0), **state(0)),
+                            s[:, 0].shape).astype(float)
     trade_cost = cost_rate * np.abs(delta) * s[:, 0]
     cash = price - delta * s[:, 0] - trade_cost
+    if use_bond:
+        units = np.broadcast_to(hedger.bond_units(times[0], s[:, 0], var_at(0), **state(0)),
+                                s[:, 0].shape).astype(float)
+        bond_cost = bond_cost_rate * np.abs(units) * paths.bond[:, 0]
+        cash = cash - units * paths.bond[:, 0] - bond_cost
+        trade_cost = trade_cost + bond_cost
     costs = trade_cost.copy()
-    t_prev = times[0]
+    j_prev = 0
     for j in dates[1:]:
         t = times[j]
-        cash = cash * np.exp(r * (t - t_prev))
-        new_delta = hedger.delta(t, s[:, j], var_at(j))
+        cash = cash * growth(j_prev, j)
+        new_delta = hedger.delta(t, s[:, j], var_at(j), **state(j))
         traded = new_delta - delta
         trade_cost = cost_rate * np.abs(traded) * s[:, j]
         cash = cash - traded * s[:, j] - trade_cost
-        costs += trade_cost * np.exp(-r * t)
-        delta, t_prev = new_delta, t
+        if use_bond:
+            new_units = hedger.bond_units(t, s[:, j], var_at(j), **state(j))
+            bond_cost = bond_cost_rate * np.abs(new_units - units) * paths.bond[:, j]
+            cash = cash - (new_units - units) * paths.bond[:, j] - bond_cost
+            trade_cost = trade_cost + bond_cost
+            units = new_units
+        costs += trade_cost * pv(j)
+        delta, j_prev = new_delta, j
 
-    t_end = times[-1]
-    cash = cash * np.exp(r * (t_end - t_prev))
+    cash = cash * growth(j_prev, n_steps)
     unwind_cost = cost_rate * np.abs(delta) * s[:, -1]
     portfolio = cash + delta * s[:, -1] - unwind_cost
-    costs += unwind_cost * np.exp(-r * t_end)
-    pnl = np.exp(-r * t_end) * (portfolio - contract.payoff(s[:, -1]))
+    if use_bond:
+        bond_cost = bond_cost_rate * np.abs(units) * paths.bond[:, -1]
+        portfolio = portfolio + units * paths.bond[:, -1] - bond_cost
+        unwind_cost = unwind_cost + bond_cost
+    costs += unwind_cost * pv(n_steps)
+    pnl = pv(n_steps) * (portfolio - contract.payoff(s[:, -1]))
     return HedgeResult(getattr(hedger, "label", type(hedger).__name__), rebalance_every,
                        cost_rate, price, pnl, costs)
 

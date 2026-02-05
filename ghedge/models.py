@@ -23,12 +23,19 @@ class Paths:
     variance : (n_paths, n_steps + 1) array of instantaneous variance, or None
     brownian : (n_paths,) terminal value of the Brownian motion driving the
         index (used for pathwise Greeks and control variates)
+    short_rate, discount, bond : (n_paths, n_steps + 1) arrays, or None
+        Stochastic-rate models only: the short rate, the discount factor
+        ``D(0, t)`` and the price of a zero-coupon bond usable as a hedge.
+        When ``discount`` is None, the backtester uses the contract's flat rate.
     """
 
     times: np.ndarray
     index: np.ndarray
     variance: np.ndarray | None
     brownian: np.ndarray
+    short_rate: np.ndarray | None = None
+    discount: np.ndarray | None = None
+    bond: np.ndarray | None = None
 
     @property
     def n_paths(self) -> int:
