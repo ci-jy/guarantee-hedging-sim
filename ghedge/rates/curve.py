@@ -6,8 +6,8 @@ of two schemes:
 
 ``monotone_convex``
     Hagan and West (2006). The instantaneous forward curve is built from the
-    discrete forwards between knots; it is continuous, stays within the
-    neighbouring discrete forwards and reproduces every knot exactly.
+    discrete forwards between knots; it is continuous and local, preserves
+    monotonicity of the discrete forwards and reproduces every knot exactly.
 ``cubic``
     Natural cubic spline through ``(0, 0)`` and ``(t_i, y_i)``; the forward
     curve is its derivative, so it is smooth but can oscillate.
