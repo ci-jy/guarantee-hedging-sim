@@ -26,7 +26,9 @@ This report prices a guaranteed minimum maturity benefit (GMMB) by Monte Carlo,
 checks the price against the closed-form Black-Scholes value, and studies
 how well the guarantee can be delta-hedged: as a function of rebalancing
 frequency and transaction costs, when the hedging model is wrong (the market
-follows Heston), and on historical S&P 500 paths.
+follows Heston), and on historical S&P 500 paths. Section 9 replaces the flat
+discount rate with a Hull-White short-rate model fitted to the Treasury curve
+and measures what assuming deterministic rates misses.
 
 Every number below is produced by the `ghedge` package from fixed random seeds,
 so re-running the notebook reproduces it.
@@ -392,8 +394,339 @@ either way. That
 matches the Heston experiment in section 7: once volatility is stochastic,
 rebalancing frequency is a second-order lever compared with the volatility
 assumption.
+""")
 
-## 9. Summary
+md(r"""
+## 9. Stochastic interest rates: Hull-White and a hybrid equity-rate model
+
+Sections 2-8 discount at one flat rate. For a 10-20 year guarantee the level
+and the randomness of interest rates matter as much as equity volatility: the
+guarantee pays $G$ far in the future, so its value moves with long rates.
+This section
+
+1. bootstraps a zero curve from the U.S. Treasury constant-maturity par
+   yields on FRED (`DGS1MO` ... `DGS30`, cached in `data/treasury_cmt_fred.csv`);
+2. fits a one-factor Hull-White model $dr = (\theta(t) - a r)\,dt + \sigma_r\,dW_r$
+   to that curve exactly and checks it against its closed forms;
+3. prices the guarantee in a hybrid model (GBM index with correlated
+   Hull-White rates) and compares Monte Carlo with the closed form;
+4. measures how the value depends on rate volatility and correlation, and the
+   error from assuming deterministic rates;
+5. hedges the guarantee with the index plus a zero-coupon bond.
+
+### 9.1 Yield curve bootstrap
+
+CMT yields are par yields on a semi-annual bond-equivalent basis. Maturities
+up to six months are treated as zero-coupon instruments, longer ones as
+semi-annual par bonds. The knot zero rates are solved simultaneously so that
+every instrument prices to par. Between knots, $-\ln P(0,t)$ is interpolated
+either with the monotone-convex method of Hagan and West (2006) or with a
+natural cubic spline.
+""")
+
+code(r"""
+from ghedge.data import load_treasury, par_curve
+from ghedge.rates import (HullWhite, HybridHedger, HybridModel, bootstrap_series, repricing_errors,
+                          fit_to_yield_volatility, yield_volatility)
+from ghedge.rates import hybrid
+from ghedge.rates.curve import _cashflows
+from ghedge.rates.hullwhite import b_factor, mc_bond_option, mc_zcb
+
+treasury = load_treasury()
+par = par_curve(treasury)
+print(f"Treasury curve of {par.name.date()} ({len(treasury)} dates in the cached history)")
+curves = {m: bootstrap_series(par, m) for m in ["monotone_convex", "cubic"]}
+curve = curves["monotone_convex"]
+fit = pd.DataFrame({"par_yield": par.values}, index=pd.Index(par.index.round(3), name="maturity"))
+for m, cv in curves.items():
+    fit[f"zero_{m}"] = cv.zeros
+    fit[f"reprice_err_{m}"] = repricing_errors(cv, par.index, par.values)
+display(fit.style.format({c: "{:.3e}" if c.startswith("reprice") else "{:.5f}" for c in fit.columns}))
+print("max |PV - par| : " + ", ".join(f"{m} {np.abs(fit[f'reprice_err_{m}']).max():.1e}" for m in curves))
+
+t = np.linspace(0.0, 30.0, 601)
+fig, ax = plt.subplots()
+ax.plot(par.index, par.values, "ko", label="CMT par yields")
+for m, cv in curves.items():
+    ax.plot(t[1:], cv.zero_rate(t[1:]), label=f"zero rate, {m}")
+    ax.plot(t, cv.forward(t), "--", label=f"instantaneous forward, {m}")
+ax.set_xlabel("maturity (years)"); ax.set_ylabel("rate"); ax.legend(fontsize=8)
+ax.set_title(f"Treasury curve {par.name.date()}")
+plt.show()
+""")
+
+md(r"""
+Both interpolations reprice the inputs exactly; they differ between the
+knots, mostly in the forward curve beyond 10 years where the instruments are
+sparse. The cubic spline's forward curve has a continuous slope but is
+global: moving one input yield shifts the forward curve everywhere and it can
+oscillate between sparse knots. The monotone-convex forward is only
+continuous, but it is local (each segment depends on its neighbours only) and
+keeps the forward curve monotone where the discrete forwards are.
+The rest of the section uses the monotone-convex curve.
+
+### 9.2 Hull-White parameters and the fitted drift
+
+The drift $\theta(t)$ is chosen so that the model reproduces the curve for any
+$(a, \sigma_r)$. Swaption volatilities are not freely available, so $(a, \sigma_r)$
+are fitted to the historical volatility of weekly changes in the 2-30 year
+yields over the last three years: the model's zero-yield volatility at tenor
+$\tau$ is $\sigma_r B(\tau)/\tau$ with $B(\tau) = (1 - e^{-a\tau})/a$. This is
+a real-world estimate used as a proxy for the risk-neutral volatility.
+""")
+
+code(r"""
+vols = yield_volatility(treasury, min_maturity=2.0, start=par.name - pd.DateOffset(years=3))
+a_fit, sigma_r_fit = fit_to_yield_volatility(vols.index, vols.values)
+print(f"fitted a = {a_fit:.4f}, sigma_r = {sigma_r_fit:.4%}")
+hw_model = HullWhite(curve, a=a_fit, sigma=sigma_r_fit)
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+tau = np.linspace(1, 30, 100)
+axes[0].plot(vols.index, vols.values, "ko", label="observed (weekly changes, annualised)")
+axes[0].plot(tau, sigma_r_fit * b_factor(a_fit, tau) / tau, label="Hull-White fit")
+axes[0].set_xlabel("tenor (years)"); axes[0].set_ylabel("yield volatility"); axes[0].legend()
+axes[0].set_title("Yield volatility term structure")
+tt = np.linspace(0, 30, 601)
+axes[1].plot(tt, hw_model.theta(tt), label=r"$\theta(t)$")
+axes[1].plot(tt, curve.forward(tt), "--", label=r"$f(0,t)$")
+axes[1].plot(tt, hw_model.alpha(tt), ":", label=r"$E[r(t)] = \alpha(t)$")
+axes[1].set_xlabel("t (years)"); axes[1].legend(); axes[1].set_title("Fitted drift")
+plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+The fitted mean reversion is weak, so long yields are nearly as volatile as
+short ones (the model is close to Ho-Lee). A one-factor model cannot produce
+the hump in observed volatilities, which peaks around five years because the
+short end is anchored by the policy rate; only tenors of two years and more
+are used in the fit.
+
+### 9.3 Validation against closed forms
+
+**Zero-coupon bonds.** With $r = x + \alpha(t)$ and $x$ an Ornstein-Uhlenbeck
+process, $x$ and $\int x\,ds$ are jointly Gaussian, so the discount factor
+$D(0,T) = e^{-\int_0^T r\,ds}$ is sampled exactly. Its mean must equal
+$P(0,T)$ from the curve.
+""")
+
+code(r"""
+mats = [1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+est, se = mc_zcb(hw_model, mats, 200_000, rng=31)
+zcb_table = pd.DataFrame({"curve P(0,T)": curve.discount(mats), "MC E[D(0,T)]": est, "std_error": se},
+                         index=pd.Index(mats, name="T"))
+zcb_table["z"] = (zcb_table["MC E[D(0,T)]"] - zcb_table["curve P(0,T)"]) / zcb_table["std_error"]
+display(zcb_table)
+""")
+
+md(r"""
+**Bond options.** A European option on a zero-coupon bond has the Hull-White
+closed form; an option on a coupon bond is priced by Jamshidian's
+decomposition (a portfolio of zero-coupon bond options struck at the bond
+prices that correspond to the critical short rate $r^*$). Monte Carlo samples
+$r(T)$ and $D(0,T)$ exactly and prices the bond at expiry with the affine
+formula. The control-variate estimator uses $D(0,T)$ and the discounted bond
+price, both with known means.
+""")
+
+code(r"""
+rows = []
+T_opt = 5.0
+atm = float(curve.discount(10.0) / curve.discount(T_opt))
+cpn_t, cpn_a = _cashflows(10.0, 0.05)
+cases = [("ZCB 5y into 10y", [10.0], [1.0], k) for k in (0.95 * atm, atm, 1.05 * atm)] + \
+        [("5% coupon bond 5y into 15y", cpn_t + T_opt, cpn_a, k) for k in (0.9, 1.0, 1.1)]
+for i, (name, times, amounts, k) in enumerate(cases):
+    for kind in ["call", "put"]:
+        exact = hw_model.coupon_bond_option(T_opt, times, amounts, k, kind)
+        plain = mc_bond_option(hw_model, T_opt, times, amounts, k, kind, 200_000, rng=40 + i)
+        cv = mc_bond_option(hw_model, T_opt, times, amounts, k, kind, 200_000, rng=40 + i, control=True)
+        rows.append({"underlying": name, "strike": k, "kind": kind, "closed_form": exact,
+                     "mc_plain": plain.estimate, "z_plain": (plain.estimate - exact) / plain.std_error,
+                     "mc_control": cv.estimate, "z_control": (cv.estimate - exact) / cv.std_error,
+                     "se_ratio": plain.std_error / cv.std_error})
+options = pd.DataFrame(rows)
+display(options)
+print(f"max |z|: plain {options['z_plain'].abs().max():.2f}, control {options['z_control'].abs().max():.2f}")
+""")
+
+md(r"""
+### 9.4 Hybrid model: the guarantee with stochastic rates
+
+The index follows $dS/S = r\,dt + \sigma_S\,dW_S$ with $d\langle W_S, W_r\rangle = \rho\,dt$.
+Under the $T$-forward measure the forward index $S_t/P(t,T)$ is lognormal with
+volatility vector $\sigma_S\,dW_S + \sigma_r B(T-t)\,dW_r$, so the guarantee is
+a Black-Scholes put with discount factor $P(0,T)$ and total variance
+
+$$v(T) = \sigma_S^2 T + 2\rho\sigma_S\sigma_r\int_0^T B(u)\,du + \sigma_r^2\int_0^T B(u)^2\,du.$$
+
+That is Black-Scholes at the zero rate $-\ln P(0,T)/T$ with the volatility
+raised from $\sigma_S$ to $\sqrt{v(T)/T}$. Monte Carlo simulates
+$(x, \int x\,ds, W_S)$ exactly and discounts each path with its own $D(0,T)$;
+the controls are $D(0,T) S_T$ (mean $S_0$) and $D(0,T)$ (mean $P(0,T)$).
+
+The weekly correlation between S&P 500 log returns and changes in the
+10-year yield over the cached history is printed below; it is close to zero,
+so the base case uses $\rho = 0$ and the sensitivity covers $\pm 0.5$.
+""")
+
+code(r"""
+weekly = pd.concat([np.log(levels).resample("W-FRI").last().diff(),
+                    treasury["DGS10"].resample("W-FRI").last().diff()], axis=1).dropna()
+print(f"corr(weekly S&P 500 log return, weekly change in 10y yield) = {weekly.corr().iloc[0, 1]:.3f}")
+
+rows = []
+for T in [10.0, 20.0]:
+    c = contract.with_(maturity=T)
+    for rho in [-0.3, 0.0, 0.3]:
+        m = HybridModel(hw_model, sigma=sigma, rho=rho)
+        exact = float(hybrid.gmmb_value(c, m))
+        for method in ["plain", "antithetic_control"]:
+            res = price_gmmb(c, m, 200_000, method, rng=int(10 * T + 10 * rho + 50))
+            rows.append({"maturity": T, "rho": rho, "method": method, "effective_vol": float(m.effective_vol(T)),
+                         "closed_form": exact, "mc": res.estimate, "std_error": res.std_error,
+                         "z": (res.estimate - exact) / res.std_error})
+hybrid_table = pd.DataFrame(rows)
+display(hybrid_table)
+print(f"max |z| over {len(hybrid_table)} estimates: {hybrid_table['z'].abs().max():.2f}")
+""")
+
+md(r"""
+### 9.5 Sensitivity to rate volatility and correlation; the deterministic-rate error
+
+The deterministic-rate value keeps the same curve but sets $\sigma_r = 0$
+(Black-Scholes at the zero rate to maturity). The flat-rate value is the
+original pricer at the 3% rate used in sections 1-7.
+""")
+
+code(r"""
+rate_vols = [0.0, 0.005, sigma_r_fit, 0.0125, 0.015]
+rhos = [-0.5, -0.25, 0.0, 0.25, 0.5]
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+grids = {}
+for ax, T in zip(axes, [10.0, 20.0]):
+    c = contract.with_(maturity=T)
+    base = HybridModel(hw_model, sigma=sigma, rho=0.0)
+    grids[T] = hybrid.sensitivity_grid(c, base, rate_vols, rhos)
+    for rho in rhos:
+        ax.plot(np.array(rate_vols) * 100, grids[T][rho], "o-", label=rf"$\rho$ = {rho}")
+    ax.axhline(float(hybrid.deterministic_rate_value(c, base)), color="k", ls="--", lw=1, label="deterministic rates")
+    ax.set_xlabel(r"rate volatility $\sigma_r$ (%)"); ax.set_ylabel("guarantee value per 100")
+    ax.set_title(f"{T:.0f}-year guarantee"); ax.legend(fontsize=8)
+plt.tight_layout(); plt.show()
+for T, g in grids.items():
+    print(f"{T:.0f}-year guarantee value by rate volatility (rows) and correlation (columns):")
+    display(g.rename(index=lambda v: f"{v:.2%}"))
+""")
+
+code(r"""
+rows = []
+for T in [5.0, 10.0, 15.0, 20.0]:
+    c = contract.with_(maturity=T)
+    for rho in [-0.3, 0.0, 0.3]:
+        m = HybridModel(hw_model, sigma=sigma, rho=rho)
+        stoch = float(hybrid.gmmb_value(c, m))
+        det = float(hybrid.deterministic_rate_value(c, m))
+        rows.append({"maturity": T, "rho": rho, "stochastic_rates": stoch, "deterministic_rates": det,
+                     "flat_3pct": float(bs.gmmb_value(c, sigma)),
+                     "det_error": det - stoch, "det_error_pct": 100 * (det - stoch) / stoch})
+det_table = pd.DataFrame(rows)
+display(det_table)
+""")
+
+md(r"""
+At $\rho = 0$, stochastic rates add variance to the forward index, so the
+deterministic-rate value **understates** the guarantee, and the gap grows
+with maturity (the extra variance $\sigma_r^2\int_0^T B(u)^2du$ grows like
+$\sigma_r^2 T^3/3$ when $a$ is small). A
+negative correlation offsets the bond-price variance and can make the
+deterministic value an overstatement. The flat 3% rate understates rates
+relative to the current curve, so it overstates the guarantee by much more
+than either effect: the level of the curve matters first, its volatility next.
+
+### 9.6 Hedging with the index and a zero-coupon bond
+
+The value $V(t, S, P)$ depends on the index and on the price $P(t,T)$ of the
+zero-coupon bond maturing with the guarantee, and it is homogeneous of degree
+one in $(S, P)$: $V = S\,\partial_S V + P\,\partial_P V$. Holding $\partial_S V$
+index units and $\partial_P V$ bonds replicates the guarantee, and this hedge
+neutralises both equity and rate risk. The backtester now accrues cash at the
+simulated short rate and discounts each path with its own $D(0,t)$. Three
+hedgers, all charging the stochastic-rate value:
+
+| strategy | instruments | hedge ratio |
+|---|---|---|
+| BS, deterministic rates | index + cash | Black-Scholes delta at the zero rate and the effective volatility |
+| hybrid delta, index only | index + cash | $\partial_S V$ from the hybrid model, observing $r_t$ |
+| hybrid delta, index + bond | index + bond + cash | $\partial_S V$ and $\partial_P V$ |
+
+Paths: 10-year guarantee, 2,000 paths on a weekly grid, 4% equity risk
+premium, fitted Hull-White parameters, $\rho = 0$. The baseline is the same
+index-only Black-Scholes hedge when rates are deterministic ($\sigma_r = 0$,
+same random numbers).
+""")
+
+code(r"""
+T_h = 10.0
+rate_contract = contract.with_(maturity=T_h)
+market = HybridModel(hw_model, sigma=sigma, rho=0.0, equity_premium=0.04)
+rate_paths = market.simulate(100.0, T_h, int(52 * T_h), n_hedge_paths, rng=61)
+det_market = HybridModel(HullWhite(curve, a=a_fit, sigma=0.0), sigma=sigma, rho=0.0, equity_premium=0.04)
+det_paths = det_market.simulate(100.0, T_h, int(52 * T_h), n_hedge_paths, rng=61)
+
+r_zero = float(-np.log(curve.discount(T_h)) / T_h)
+bs_contract = rate_contract.with_(rate=r_zero)
+rate_hedgers = [BSHedger(bs_contract, float(market.effective_vol(T_h)), label="BS, deterministic rates"),
+                HybridHedger(rate_contract, market, use_bond=False),
+                HybridHedger(rate_contract, market, use_bond=True)]
+rate_freqs = {"weekly": 1, "monthly": 4, "quarterly": 13}
+rate_hedge = rebalancing_table(rate_paths, rate_contract, rate_hedgers, frequencies=rate_freqs,
+                               cost_rates=(0.0, 0.001))
+det_base = rebalancing_table(det_paths, rate_contract, [BSHedger(bs_contract, sigma, label="baseline: sigma_r = 0, BS")],
+                             frequencies=rate_freqs, cost_rates=(0.0, 0.001))
+rate_hedge_all = pd.concat([det_base, rate_hedge], ignore_index=True)
+display(rate_hedge_all[["strategy", "frequency", "cost_rate", "price", "mean_pnl", "std_pnl", "cvar_95", "mean_costs"]])
+""")
+
+code(r"""
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+weekly_res = {h.label: backtest(rate_paths, rate_contract, h, 1) for h in rate_hedgers}
+for lab, res in weekly_res.items():
+    axes[0].hist(res.pnl, bins=60, alpha=0.5, density=True, label=f"{lab} (sd {res.pnl.std():.2f})")
+axes[0].set_xlabel("discounted hedge P&L per 100"); axes[0].legend(fontsize=8)
+axes[0].set_title("Weekly hedging, stochastic rates")
+
+r_change = rate_paths.short_rate[:, -1] - rate_paths.short_rate[:, 0]
+axes[1].scatter(r_change, weekly_res["hybrid delta, index only"].pnl, s=4, alpha=0.4, label="index only")
+axes[1].scatter(r_change, weekly_res["hybrid delta, index + bond"].pnl, s=4, alpha=0.4, label="index + bond")
+axes[1].set_xlabel("change in short rate over the contract"); axes[1].set_ylabel("hedge P&L")
+axes[1].legend(); axes[1].set_title("Index-only hedge error is driven by rates")
+plt.tight_layout(); plt.show()
+
+nc = rate_hedge_all[rate_hedge_all.cost_rate == 0].pivot(index="strategy", columns="frequency", values="std_pnl")
+display(nc[list(rate_freqs)])
+w = nc["weekly"]
+print(f"weekly hedge-error sd: deterministic-rate baseline {w['baseline: sigma_r = 0, BS']:.3f}; with stochastic rates "
+      f"BS {w['BS, deterministic rates']:.3f}, hybrid index-only {w['hybrid delta, index only']:.3f}, "
+      f"index + bond {w['hybrid delta, index + bond']:.3f} "
+      f"({w['hybrid delta, index only'] / w['hybrid delta, index + bond']:.1f}x lower than index only)")
+""")
+
+md(r"""
+**Reading the hedging result.** With deterministic rates the weekly
+Black-Scholes hedge leaves only discretisation error. Once rates are
+stochastic, any index-only hedge leaves a large error that tracks the change
+in rates over the contract (right panel): the guarantee is long duration,
+and the index position does nothing about that. Using the correct hybrid
+equity delta does not help (here it is slightly worse), because the missing piece is the bond position,
+not the equity delta. Adding the zero-coupon bond brings the error back close
+to the deterministic-rate baseline, and the remaining error again falls with
+rebalancing frequency. Transaction costs on the bond are charged at the same
+rate as on the index here, which is conservative for Treasuries.
+""")
+
+md(r"""
+## 10. Summary
 
 * Monte Carlo prices agree with the closed form within three standard errors
   on a grid of guarantee levels and maturities; error falls like $N^{-1/2}$.
@@ -405,6 +738,16 @@ assumption.
   root of the rebalancing interval; costs grow as rebalancing gets more frequent.
 * Under Heston, delta hedging with either model leaves a much larger error;
   the minimum-variance delta reduces but does not remove it.
+* The bootstrapped Treasury curve reprices every input par bond to machine
+  precision with either interpolation; Hull-White fitted to it reproduces the
+  curve by Monte Carlo, and Monte Carlo bond-option prices agree with the
+  closed form and Jamshidian's decomposition within three standard errors.
+* Stochastic rates change the value of long-dated guarantees materially: the
+  deterministic-rate value is off by the amounts in section 9.5, and the
+  sign depends on the equity-rate correlation.
+* With stochastic rates an index-only hedge leaves the interest-rate risk
+  open; adding the zero-coupon bond maturing with the guarantee removes most
+  of the hedge error.
 """)
 
 nb = nbf.v4.new_notebook()
