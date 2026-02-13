@@ -1,7 +1,7 @@
 # guarantee-hedging-sim
 
-Monte Carlo pricing and dynamic delta hedging of variable annuity maturity
-guarantees.
+Monte Carlo pricing and dynamic hedging of variable annuity maturity
+guarantees, with constant and Hull-White stochastic interest rates.
 
 A segregated fund or variable annuity with a guaranteed minimum maturity
 benefit (GMMB) promises the policyholder at least `G` at maturity, whatever
@@ -16,7 +16,16 @@ fund and usually hedges it dynamically. This project:
   distribution, its standard deviation, VaR and CVaR;
 * measures model risk: Black-Scholes hedging while the market follows Heston
   stochastic volatility, compared with hedging under the true model;
-* hedges overlapping one-year contracts on historical S&P 500 paths.
+* hedges overlapping one-year contracts on historical S&P 500 paths;
+* bootstraps a zero curve from U.S. Treasury par yields (monotone-convex or
+  cubic interpolation) and fits a one-factor Hull-White short-rate model to it
+  exactly, validated against closed-form bond and bond-option prices;
+* prices the guarantee in a hybrid model (GBM index, correlated Hull-White
+  rates) by Monte Carlo and in closed form, measures its sensitivity to rate
+  volatility and equity-rate correlation and the error from assuming
+  deterministic rates;
+* hedges the guarantee with the index plus a zero-coupon bond and compares
+  that with index-only delta hedging.
 
 The full write-up with charts and tables is the notebook
 [`notebooks/report.ipynb`](notebooks/report.ipynb), exported as
@@ -32,8 +41,9 @@ sudo apt-get install python3-numpy python3-scipy python3-pandas python3-matplotl
 python3 -m pip install -r requirements.txt     # or: pip install -e ".[test,notebook]"
 
 python3 -m pytest -q                                   # test suite (~10 s)
-jupyter nbconvert --to html --execute notebooks/report.ipynb --output-dir /tmp   # report (~25 s)
+jupyter nbconvert --to html --execute notebooks/report.ipynb --output-dir /tmp   # report (~30 s)
 python3 scripts/fetch_index.py                         # refresh the S&P 500 snapshot from FRED
+python3 scripts/fetch_treasury.py                      # refresh the Treasury yield snapshot from FRED
 python3 notebooks/build_report.py                      # regenerate the notebook from its source
 ```
 
@@ -55,6 +65,25 @@ paths = GBM(0.2, mu=0.07).simulate(100, c5.rate, 5, 5 * 252, 2_000, rng=2)
 print(rebalancing_table(paths, c5, [BSHedger(c5, 0.2)], cost_rates=(0, 0.001)))
 ```
 
+Stochastic rates:
+
+```python
+from ghedge.data import load_treasury, par_curve
+from ghedge.rates import HullWhite, HybridModel, HybridHedger, bootstrap_series, hybrid
+from ghedge.hedging import backtest
+
+curve = bootstrap_series(par_curve(load_treasury()), "monotone_convex")
+hw = HullWhite(curve, a=0.05, sigma=0.01)
+print(hw.coupon_bond_option(5.0, [6.0, 7.0, 8.0], [0.05, 0.05, 1.05], 1.0, "put"))  # Jamshidian
+
+model = HybridModel(hw, sigma=0.2, rho=0.0)
+print(hybrid.gmmb_value(c, model), hybrid.deterministic_rate_value(c, model))
+print(price_gmmb(c, model, 200_000, "antithetic_control", rng=1).estimate)
+
+paths = HybridModel(hw, 0.2, equity_premium=0.04).simulate(100, 10, 520, 2_000, rng=3)
+print(backtest(paths, c, HybridHedger(c, model, use_bond=True)).summary())
+```
+
 ## Layout
 
 | path | contents |
@@ -68,7 +97,12 @@ print(rebalancing_table(paths, c5, [BSHedger(c5, 0.2)], cost_rates=(0, 0.001)))
 | `ghedge/hedging.py` | hedgers (Black-Scholes, Heston, Heston minimum-variance), discrete hedging backtester, VaR/CVaR |
 | `ghedge/data.py`, `scripts/fetch_index.py` | FRED download and CSV loading with a committed fallback snapshot |
 | `ghedge/historical.py` | rolling historical hedge backtest |
+| `ghedge/rates/curve.py` | `ZeroCurve` (monotone-convex and cubic interpolation), par-bond bootstrap, repricing errors |
+| `ghedge/rates/hullwhite.py` | `HullWhite`: fitted `theta(t)`, affine bond prices, zero-coupon and Jamshidian coupon-bond options, exact simulation, Monte Carlo bond and option pricers, historical volatility fit |
+| `ghedge/rates/hybrid.py` | `HybridModel` (GBM index + correlated Hull-White), forward-measure closed form, hedge ratios, sensitivity grid, `HybridHedger` |
+| `ghedge/data.py`, `scripts/fetch_treasury.py` | Treasury constant-maturity yields from FRED, par-curve selection |
 | `data/sp500_fred.csv` | S&P 500 daily closes from FRED (series `SP500`, 2016-10-03 to 2026-10-02) |
+| `data/treasury_cmt_fred.csv` | Treasury CMT yields from FRED (`DGS1MO` ... `DGS30`, 2016-10-03 to 2026-10-01) |
 | `notebooks/build_report.py` | source of the report notebook |
 | `tests/` | pytest suite, including statistical checks |
 
@@ -85,7 +119,15 @@ print(rebalancing_table(paths, c5, [BSHedger(c5, 0.2)], cost_rates=(0, 0.001)))
   c = 1.124, issue age 55). Decrements are deterministic and independent of
   the market, so the cohort liability is `_T p_x` times one put. Policyholders
   who leave early take their fund value and the guarantee lapses with them.
-* **Rates.** One flat continuously compounded rate. No interest-rate model.
+* **Rates.** Sections 1-8 of the report use one flat continuously compounded
+  rate (`GMMBContract.rate`). The stochastic-rate extension uses a one-factor
+  Hull-White model `dr = (theta(t) - a r) dt + sigma_r dW_r` fitted to the
+  bootstrapped Treasury curve, with `a` and `sigma_r` fitted to historical
+  yield volatilities (no swaption data). Rates are simulated under the
+  risk-neutral measure only; the real-world equity drift is the short rate
+  plus a constant premium.
+* **Hybrid model.** `dS/S = r dt + sigma_S dW_S`, `d<W_S, W_r> = rho dt`,
+  constant `sigma_S` and `rho`. The fund is still `S_t exp(-m t)`.
 * **Black-Scholes.** The fund is a stock with dividend yield `m`, so the
   guarantee value is the textbook put with yield, scaled by `_T p_x`.
 * **Heston.** `dv = kappa (theta - v) dt + xi sqrt(v) dW2`, `corr(dW1, dW2) = rho`.
@@ -146,6 +188,44 @@ Hedgers:
 * `HestonHedger(..., minimum_variance=True)`: `dV/dS + rho xi / S * dV/dv`,
   the index position that minimises the instantaneous hedge variance.
 
+**Curve bootstrap.** CMT yields are par yields on a semi-annual
+bond-equivalent basis. Maturities up to six months are zero-coupon
+instruments; longer ones are semi-annual par bonds (no accrued interest or
+day counts). The curve interpolates `-ln P(0, t)` with either the
+monotone-convex scheme of Hagan and West (2006), whose forward curve is
+continuous and local, or a natural cubic spline; the forward is held flat
+beyond 30 years. Because both schemes couple neighbouring segments, all knot
+zero rates are solved at once with SciPy's Powell hybrid root finder until
+every instrument prices to par (typically to 1e-16).
+
+**Hull-White.** With `r = x + alpha(t)`, `dx = -a x dt + sigma_r dW`,
+`alpha(t) = f(0,t) + sigma_r^2 B(t)^2 / 2`, the model reproduces `P(0, t)` for
+any parameters. `x` and its integral are jointly Gaussian over a step, so the
+short rate and `D(0, t) = exp(-int r)` are simulated exactly (no
+discretisation error). Closed forms: affine bond prices `P(t, T) = A e^{-B r}`,
+the Hull-White zero-coupon bond option, and coupon-bond options by
+Jamshidian's decomposition. The Monte Carlo bond-option pricer can use `D(0,T)`
+and the discounted bond price as control variates. `(a, sigma_r)` are fitted
+by least squares to the model's yield-volatility curve `sigma_r B(tau)/tau`
+against the annualised standard deviation of weekly 2-30 year yield changes
+over the last three years.
+
+**Hybrid closed form.** Under the `T`-forward measure, `S_t / P(t, T)` is
+lognormal with total variance
+`v(T) = sigma_S^2 T + 2 rho sigma_S sigma_r int B + sigma_r^2 int B^2`, so the
+guarantee is the Black-Scholes put at the zero rate `-ln P(0,T)/T` with
+volatility `sqrt(v(T)/T)`. Monte Carlo simulates `(x, int x, W_S)` exactly,
+discounts each path with its own `D(0, T)`, and uses `D(0,T) S_T` and `D(0,T)`
+as controls (`price_gmmb` accepts a `HybridModel`).
+
+**Index + bond hedge.** The value `V(t, S, P)` is homogeneous of degree one in
+the index and the price `P(t, T)` of the zero-coupon bond maturing with the
+guarantee, so holding `dV/dS` index units and `dV/dP` bonds replicates it.
+The backtester accrues cash at the simulated short rate, discounts each path
+with `D(0, t)`, and trades the bond when the hedger has a `bond_units` method
+(bond trades cost `bond_cost_rate`, by default the same as index trades).
+With flat-rate paths it behaves exactly as before.
+
 **Historical backtest.** One-year contracts are issued every 21 trading days
 along the S&P 500 series. Each window is rescaled to start at 100, priced and
 hedged with Black-Scholes at the trailing one-year realised volatility at
@@ -190,9 +270,31 @@ All numbers come from fixed seeds and are reproduced by the notebook
   issue-date volatility. Rebalancing more often did not reduce the error on
   this sample.
 
+* **Stochastic rates** (curve of 2026-10-01, fitted `a = 0.0127`,
+  `sigma_r = 0.94%`, `sigma_S = 20%`). Both interpolations reprice all 11 par
+  instruments to about 1e-16. Monte Carlo zero-coupon bond prices at 1-30
+  years are within 3 SE of the curve (largest |z| = 2.24), and 12 zero-coupon
+  and coupon bond-option prices are within 3 SE of the closed forms (largest
+  |z| 1.84 plain, 1.45 with controls; the controls cut the SE 1.3-3.4x).
+  Hybrid Monte Carlo agrees with the closed form for 10 and 20-year
+  guarantees at `rho` = -0.3, 0, 0.3 (largest |z| = 1.55).
+* **Value effect.** At `rho = 0` the 10-year guarantee is worth 6.35 with
+  stochastic rates against 6.00 with deterministic rates (-5.5% error), and
+  the 20-year guarantee 2.69 against 2.10 (-22%). With `rho = +0.3` the
+  deterministic error reaches -15% at 10 years and -36% at 20 years; with
+  `rho = -0.3` deterministic rates overstate the value by 1.8-6.5%. The flat 3%
+  rate of the earlier sections, below the current curve, overstates the
+  value by far more (11.23 at 10 years).
+* **Hedging with stochastic rates** (10-year guarantee, 2,000 paths, weekly
+  grid, no costs). Index-only hedges leave a hedge-error standard deviation of
+  2.78 (Black-Scholes at deterministic rates) and 3.10 (hybrid delta),
+  against 0.41 for the same Black-Scholes hedge when rates are deterministic.
+  Adding the zero-coupon bond brings it back to 0.41 weekly, 0.79 monthly and
+  1.45 quarterly, about 7.5x lower than the index-only hybrid hedge.
+
 ## Tests
 
-`python3 -m pytest -q` runs 72 tests in about 10 seconds. The statistical
+`python3 -m pytest -q` runs 136 tests in about 10 seconds. The statistical
 tests use fixed seeds and check:
 
 * the Monte Carlo price is within 3 SE of the closed form on the 3 x 4 grid of
@@ -213,7 +315,27 @@ tests use fixed seeds and check:
 * Black-Scholes hedging in a Heston market has more than twice the error of
   the same hedge in a GBM market, and the minimum-variance delta improves on it;
 * historical CSV parsing (FRED `.` markers), window alignment and the
-  backtest on the snapshot.
+  backtest on the snapshot;
+* the bootstrapped curve reprices the Treasury par bonds to within 1e-6 on
+  four dates (normal, near-zero and inverted curves), for both
+  interpolations; the forward curve integrates to `-ln P`; the
+  monotone-convex segment integrals vanish; flat curves stay flat;
+* Hull-White: `theta` equals `alpha' + a alpha`; Monte Carlo zero-coupon bond
+  prices are within 3 SE of the curve at 1-30 years; simulated moments and
+  the exact step covariance match a fine Euler scheme; zero-coupon and
+  Jamshidian coupon-bond option prices are within 3 SE of Monte Carlo, with
+  and without control variates; put-call parity; the volatility fit
+  recovers known parameters;
+* hybrid: Monte Carlo within 3 SE of the closed form for three correlations
+  and two maturities (one-step and multi-step grids); the discounted index
+  and the discount factor are martingales; the simulated correlation is
+  `rho`; the forward variance matches numerical integration; `sigma_r = 0`
+  reduces to Black-Scholes; hedge ratios match finite differences and
+  replicate the value;
+* stochastic-rate hedging: the index + bond hedge has under 0.3x the error
+  of the index-only hedges, is unbiased and improves with frequency; bond
+  trading costs are accounted exactly; with zero rate volatility on a flat
+  curve the new backtest path reproduces the flat-rate backtest.
 
 ## Limitations
 
@@ -222,11 +344,18 @@ tests use fixed seeds and check:
 * The hedge is funded by an upfront price equal to the model value. The fee
   income that funds guarantees in practice, its split from management fees,
   and fair-fee solving are not modelled.
-* One hedge instrument (the index). No vega hedging with options, so the
-  Heston variance risk is left open by design.
+* No vega hedging with options, so the Heston variance risk is left open by
+  design. The rate hedge uses one zero-coupon bond matching the guarantee.
 * The Heston hedger observes the true instantaneous variance and parameters.
   In practice both would be estimated or calibrated, which adds error.
-* Flat interest rate, no interest-rate or basis risk between fund and index.
+* Rates: one factor, so all yields move together and the curve cannot twist;
+  the observed hump in yield volatility (peaking near five years) is not
+  reproduced. `(a, sigma_r)` come from historical yield changes, not from
+  swaption prices, and there is no market price of rate risk. Rates can go
+  negative. The hybrid model has constant equity volatility; combining
+  Heston with Hull-White is not implemented. The CMT bootstrap ignores day
+  counts, accrued interest and the bill/bond quoting differences.
+* No basis risk between fund and index.
 * The historical backtest uses a price index without dividends and a flat
   2% rate, over about ten years of FRED data (FRED only publishes the most
   recent ten years of `SP500`). The windows overlap heavily, so they are not
@@ -241,6 +370,13 @@ Reserve Bank of St. Louis (FRED, series `SP500`), downloaded on 2026-10-03.
 `scripts/fetch_index.py` refreshes it, and the committed file is used when
 the download fails.
 
+`data/treasury_cmt_fred.csv` holds daily U.S. Treasury constant-maturity
+yields (percent) from FRED, series `DGS1MO`, `DGS3MO`, `DGS6MO`, `DGS1`,
+`DGS2`, `DGS3`, `DGS5`, `DGS7`, `DGS10`, `DGS20` and `DGS30`, from 2016-10-03
+to 2026-10-01, downloaded on 2026-10-03. `scripts/fetch_treasury.py`
+refreshes it, with the same snapshot fallback. Tests and the report read the
+cached file, so they run offline.
+
 ## References
 
 * M. Hardy, *Investment Guarantees: Modeling and Risk Management for
@@ -252,5 +388,12 @@ the download fails.
 * R. Lord, R. Koekkoek, D. van Dijk, "A comparison of biased simulation
   schemes for stochastic volatility models", *Quantitative Finance*, 2010.
 * P. Glasserman, *Monte Carlo Methods in Financial Engineering*, Springer, 2003.
+* J. Hull, A. White, "Pricing interest-rate-derivative securities",
+  *Review of Financial Studies*, 1990.
+* F. Jamshidian, "An exact bond option formula", *Journal of Finance*, 1989.
+* P. Hagan, G. West, "Interpolation methods for curve construction",
+  *Applied Mathematical Finance*, 2006.
+* D. Brigo, F. Mercurio, *Interest Rate Models: Theory and Practice*,
+  Springer, 2nd ed., 2006.
 * J. Hull, A. White, "Optimal delta hedging for options", *Journal of Banking
   & Finance*, 2017.

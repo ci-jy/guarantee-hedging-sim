@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ghedge"
-version = "0.1.0"
-description = "Monte Carlo pricing and dynamic delta hedging of variable annuity maturity guarantees"
+version = "0.2.0"
+description = "Monte Carlo pricing and dynamic hedging of variable annuity maturity guarantees with constant and Hull-White stochastic rates"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,7 +20,7 @@ test = ["pytest>=7"]
 notebook = ["jupyter", "nbconvert>=7", "nbformat>=5", "ipykernel>=6"]
 
 [tool.setuptools]
-packages = ["ghedge"]
+packages = ["ghedge", "ghedge.rates"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
