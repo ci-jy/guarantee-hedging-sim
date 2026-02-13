@@ -397,3 +397,5 @@ cached file, so they run offline.
   Springer, 2nd ed., 2006.
 * J. Hull, A. White, "Optimal delta hedging for options", *Journal of Banking
   & Finance*, 2017.
+
+Project period: 2026-01-12 to 2026-02-13.
