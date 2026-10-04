@@ -1,7 +1,31 @@
 # guarantee-hedging-sim
 
-Monte Carlo pricing and dynamic hedging of variable annuity maturity
-guarantees, with constant and Hull-White stochastic interest rates.
+Monte Carlo pricing and dynamic hedging of variable annuity and segregated fund maturity guarantees (GMMB), with constant and Hull-White stochastic interest rates: how much the guarantee is worth, and how well an insurer can hedge it.
+
+## Results
+
+- **Cut Monte Carlo variance 10.5x** with antithetic and control variates in Python/NumPy; prices matched the Black-Scholes and Heston closed forms within 3 standard errors.
+- **Showed daily rebalancing cuts simulated hedge error 4.4x vs monthly** with a delta-hedging backtester (transaction costs, VaR/CVaR), also run on S&P 500 history and under Heston stochastic volatility.
+- **Showed fixed rates undervalue a 20-year guarantee by 22%** with a Hull-White model fitted to the U.S. Treasury curve (repricing its bonds within 1e-6; option prices matching Jamshidian's closed form).
+- **Cut hedge error 7.5x under stochastic rates** (standard deviation 3.10 to 0.41) by adding a zero-coupon bond to index-only delta hedging, in a hybrid equity and Hull-White model validated against its closed form.
+
+![Weekly hedging under stochastic rates: index-only vs index + bond](docs/stochastic_rate_hedging.png)
+
+Weekly hedging of a 10-year guarantee under stochastic rates (2,000 paths): the index-only hedge error tracks the change in rates, and adding the zero-coupon bond removes it. From the report notebook ([`docs/report.html`](docs/report.html), section 9).
+
+**Stack:** Python, NumPy, SciPy, pandas, matplotlib, Jupyter, pytest; data from FRED (S&P 500, U.S. Treasury yields)
+
+## Quickstart
+
+```bash
+python3 -m pip install -r requirements.txt                                        # or: pip install -e ".[test,notebook]"
+python3 -m pytest -q                                                              # 136 tests, including the statistical checks
+jupyter nbconvert --to html --execute notebooks/report.ipynb --output-dir /tmp    # the full report with charts and tables
+```
+
+The full write-up is the notebook [`notebooks/report.ipynb`](notebooks/report.ipynb), exported as [`docs/report.html`](docs/report.html).
+
+## What it does
 
 A segregated fund or variable annuity with a guaranteed minimum maturity
 benefit (GMMB) promises the policyholder at least `G` at maturity, whatever
@@ -27,25 +51,11 @@ fund and usually hedges it dynamically. This project:
 * hedges the guarantee with the index plus a zero-coupon bond and compares
   that with index-only delta hedging.
 
-The full write-up with charts and tables is the notebook
-[`notebooks/report.ipynb`](notebooks/report.ipynb), exported as
-[`docs/report.html`](docs/report.html).
+## Use it from Python
 
-## Quick start
-
-```bash
-# Python 3.10+; on Debian/Ubuntu the system packages work:
-sudo apt-get install python3-numpy python3-scipy python3-pandas python3-matplotlib \
-    python3-pytest jupyter-nbconvert python3-ipykernel python3-nbformat
-# or, in a virtual environment:
-python3 -m pip install -r requirements.txt     # or: pip install -e ".[test,notebook]"
-
-python3 -m pytest -q                                   # test suite (~10 s)
-jupyter nbconvert --to html --execute notebooks/report.ipynb --output-dir /tmp   # report (~30 s)
-python3 scripts/fetch_index.py                         # refresh the S&P 500 snapshot from FRED
-python3 scripts/fetch_treasury.py                      # refresh the Treasury yield snapshot from FRED
-python3 notebooks/build_report.py                      # regenerate the notebook from its source
-```
+Python 3.10+. On Debian/Ubuntu the system packages work instead of pip:
+`sudo apt-get install python3-numpy python3-scipy python3-pandas python3-matplotlib python3-pytest jupyter-nbconvert python3-ipykernel python3-nbformat`.
+Refresh the data snapshots with `python3 scripts/fetch_index.py` and `python3 scripts/fetch_treasury.py` (FRED), and regenerate the notebook from its source with `python3 notebooks/build_report.py`.
 
 Example:
 
@@ -231,7 +241,7 @@ along the S&P 500 series. Each window is rescaled to start at 100, priced and
 hedged with Black-Scholes at the trailing one-year realised volatility at
 issue, with a 2% rate and 10 bp costs.
 
-## Results
+## Detailed results
 
 All numbers come from fixed seeds and are reproduced by the notebook
 (`docs/report.html`).
@@ -337,32 +347,6 @@ tests use fixed seeds and check:
   trading costs are accounted exactly; with zero rate volatility on a flat
   curve the new backtest path reproduces the flat-rate backtest.
 
-## Limitations
-
-* Decrements are deterministic and market-independent. There is no dynamic
-  (moneyness-dependent) lapse, no mortality improvement and no death benefit.
-* The hedge is funded by an upfront price equal to the model value. The fee
-  income that funds guarantees in practice, its split from management fees,
-  and fair-fee solving are not modelled.
-* No vega hedging with options, so the Heston variance risk is left open by
-  design. The rate hedge uses one zero-coupon bond matching the guarantee.
-* The Heston hedger observes the true instantaneous variance and parameters.
-  In practice both would be estimated or calibrated, which adds error.
-* Rates: one factor, so all yields move together and the curve cannot twist;
-  the observed hump in yield volatility (peaking near five years) is not
-  reproduced. `(a, sigma_r)` come from historical yield changes, not from
-  swaption prices, and there is no market price of rate risk. Rates can go
-  negative. The hybrid model has constant equity volatility; combining
-  Heston with Hull-White is not implemented. The CMT bootstrap ignores day
-  counts, accrued interest and the bill/bond quoting differences.
-* No basis risk between fund and index.
-* The historical backtest uses a price index without dividends and a flat
-  2% rate, over about ten years of FRED data (FRED only publishes the most
-  recent ten years of `SP500`). The windows overlap heavily, so they are not
-  independent samples.
-* This is not a full actuarial liability model or a regulatory capital
-  calculation.
-
 ## Data
 
 `data/sp500_fred.csv` holds S&P 500 daily closing levels from the Federal
@@ -397,5 +381,23 @@ cached file, so they run offline.
   Springer, 2nd ed., 2006.
 * J. Hull, A. White, "Optimal delta hedging for options", *Journal of Banking
   & Finance*, 2017.
+
+## Limitations and next steps
+
+* Decrements are deterministic and independent of the market: no dynamic (moneyness-dependent) lapse,
+  mortality improvement or death benefit.
+* The hedge is funded by an upfront price equal to the model value; fee income, its split from management
+  fees and fair-fee solving are not modelled.
+* No vega hedging with options, so Heston variance risk is left open by design; the rate hedge uses one
+  zero-coupon bond matching the guarantee. The Heston hedger observes the true variance and parameters,
+  which in practice would be calibrated.
+* Rates are one-factor: the curve cannot twist and the hump in yield volatility is not reproduced.
+  `(a, sigma_r)` come from historical yield changes rather than swaption prices, there is no market price of rate risk, and rates can go negative.
+  The hybrid has constant equity volatility; combining Heston with Hull-White is the natural next step. The CMT bootstrap ignores day counts and
+  accrued interest.
+* No basis risk between fund and index.
+* The historical backtest uses a price index without dividends, a flat 2% rate and about ten years of FRED
+  data (all FRED publishes for `SP500`), with heavily overlapping windows.
+* This is a pricing and hedging study, not a full liability model or a regulatory capital calculation.
 
 Project period: 2026-01-12 to 2026-02-13.
